@@ -1,122 +1,93 @@
-from selenium import webdriver
-from selenium.webdriver.edge.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from bs4 import BeautifulSoup
+"""
+main.py
+Instagramアフィリエイト巡回の全体制御スクリプト（実行エントリーポイント）
+
+このスクリプトは以下の責任を持つ：
+1. .envから設定を読み込み
+2. Instagramへログインし、指定タグの投稿を巡回
+3. 各投稿から楽天アフィリエイトURLを抽出・正規化
+4. URLの登場回数を集計し、商品名を取得
+5. 商品名 / 回数 / URL で構成されたCSVを出力
+6. 全処理のログをファイルに保存
+"""
+
 from dotenv import load_dotenv
+from browser.instagram_login import login_and_get_driver
+from browser.fetch_post_links import get_post_links
+from browser.fetch_post_texts import get_post_texts
+from parser.extract_urls import extract_affiliate_urls
+from parser.normalize_urls import normalize_url
+from parser.fetch_titles import add_product_titles  # ✅ 商品名取得ステップ
+from aggregator.count_urls import count_normalized_urls
+from aggregator.export_to_csv import export_csv
+from util.logger import setup_logger
+
 import os
-import time
 from datetime import datetime
 from pathlib import Path
 
-# --- ログ機構の設定 ---
-now = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_dir = Path("log")
-log_dir.mkdir(parents=True, exist_ok=True)
-log_file_path = log_dir / f"log_{now}.txt"
-
-def log(msg: str):
-    print(msg)
-    with open(log_file_path, "a", encoding="utf-8") as f:
-        f.write(msg + "\n")
-
-log(f"📁 ログファイル作成: {log_file_path}")
-
-# --- .env読み込み ---
+# --- 初期設定：環境変数・タイムスタンプ ---
 load_dotenv()
 USERNAME = os.getenv("INSTAGRAM_USER")
 PASSWORD = os.getenv("INSTAGRAM_PASS")
 TARGET_TAG = os.getenv("TARGET_TAG", "楽天room")
 MAX_POSTS = int(os.getenv("MAX_POSTS", 5))
 
-# --- Edge起動オプション設定 ---
-options = Options()
-options.add_argument("--start-maximized")
+now = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-driver = webdriver.Edge(options=options)
+# --- ログディレクトリとロガー初期化 ---
+log_dir = Path("log")
+log_dir.mkdir(parents=True, exist_ok=True)
+log = setup_logger(log_dir / f"log_{now}.txt")
+log(f"📁 ログファイル作成")
+
+# --- Instagramログイン ---
+log("🚀 Instagramログイン処理を開始します")
+driver = login_and_get_driver(USERNAME, PASSWORD, log)
 
 try:
-    # --- Instagramログイン画面へ ---
-    log("🔐 ログインページへアクセス中...")
-    driver.get("https://www.instagram.com/accounts/login/")
-    time.sleep(3)
-    log(f"🌐 現在URL: {driver.current_url}")
+    # --- タグページの投稿リンクを取得 ---
+    log("📌 タグ巡回を開始します")
+    post_links = get_post_links(driver, TARGET_TAG, log, max_posts=MAX_POSTS)
 
-    # --- ログイン情報入力 ---
-    username_input = driver.find_element(By.NAME, "username")
-    password_input = driver.find_element(By.NAME, "password")
+    # --- 各投稿ページから本文を取得 ---
+    log("📌 各投稿の本文を取得します")
+    post_texts = get_post_texts(driver, post_links, max_count=MAX_POSTS)
 
-    username_input.send_keys(USERNAME)
-    password_input.send_keys(PASSWORD)
-    password_input.send_keys(Keys.RETURN)
-    log("🔄 Enter押下 → ログインリクエスト送信")
+    # --- 本文から楽天アフィリエイトURLを抽出・正規化 ---
+    all_urls = []
+    for i, post in enumerate(post_texts):
+        log(f"🔎 [{i+1}/{len(post_texts)}] 投稿本文からリンク抽出中")
 
-    # --- URL変化でログイン判定（最大3秒） ---
-    for i in range(3):
-        time.sleep(1)
-        current = driver.current_url
-        log(f"⏱️ {i+1}s: 現在URL ➜ {current}")
-        if "/accounts/login/" not in current:
-            log("✅ URL遷移を検出 ➜ ログイン成功の可能性あり")
-            break
-    else:
-        log("❌ URLが変化せず、ログイン遷移が発生していない")
-        raise Exception("ログイン後の遷移が確認できませんでした")
+        # ⭐ 本文の先頭だけ確認ログ（多すぎると煩雑なので80文字制限）
+        log(f"📝 本文抜粋: {post['text'][:80].replace('\n', ' ')}...")
 
-    # --- 表示されているボタン一覧を記録 ---
-    buttons = driver.find_elements(By.TAG_NAME, "button")
-    log(f"🔘 現在表示中のボタン数: {len(buttons)}")
-    for i, btn in enumerate(buttons):
-        try:
-            log(f"  {i+1}. text = '{btn.text}'")
-        except:
-            log(f"  {i+1}. text = [取得失敗]")
+        urls = extract_affiliate_urls(post["text"])
+        normed = [normalize_url(u) for u in urls]
+        
+        if normed:
+            log(f"✅ 抽出されたリンク: {normed}")
+        else:
+            log("ℹ️ 商品リンクは見つかりませんでした")
+        all_urls.extend(normed)
 
-    # --- 「情報を保存」ボタンを押す（モーダルではなく画面上表示） ---
-    try:
-        save_info_btn = WebDriverWait(driver, 3).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), '情報を保存')]"))
-        )
-        save_info_btn.click()
-        log("📌 『情報を保存』ボタンをクリックしました")
-        time.sleep(1)
-    except:
-        log("ℹ️ 『情報を保存』ボタンは表示されませんでした")
+    # --- URLごとの登場回数を集計 ---
+    log("📊 商品リンクの出現回数を集計します")
+    count_df = count_normalized_urls(all_urls, log)
 
-    # --- タグページに移動 ---
-    url = f"https://www.instagram.com/explore/tags/{TARGET_TAG}/"
-    log(f"🌐 タグページへアクセス中: {url}")
-    driver.get(url)
-    time.sleep(5)
+    # --- 各URLから商品タイトルを取得して列追加 ---
+    log("📌 各URLから商品タイトルを取得します")
+    count_df = add_product_titles(count_df, log)
 
-    # --- スクロールして投稿読み込み ---
-    for i in range(3):
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        log(f"↕️ スクロール {i+1} 回目")
-        time.sleep(2)
-
-    # --- 投稿リンク取得 ---
-    log("🔍 投稿リンクを取得中...")
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    links = []
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if href.startswith("/p/"):
-            full_link = f"https://www.instagram.com{href}"
-            if full_link not in links:
-                links.append(full_link)
-
-    log(f"✅ {len(links)} 件の投稿リンクを取得")
-    for link in links[:MAX_POSTS]:
-        log(link)
+    # --- CSVに保存（成果物出力）---
+    log("💾 結果をCSVとして保存します")
+    export_csv(count_df, now, log)
 
 except Exception as e:
-    log(f"💥 エラー発生: {e}")
+    log(f"💥 処理中にエラーが発生しました: {e}")
 
 finally:
+    # --- ドライバ終了処理 ---
     driver.quit()
     log("🛑 ブラウザを終了しました")
     log("🎉 全処理が完了しました")
